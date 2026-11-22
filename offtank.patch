@@ -1,0 +1,96 @@
+--- a/Modules/Threat.lua
++++ b/Modules/Threat.lua
+@@ -128,8 +128,43 @@
+ -- Module code
+ ---------------------------------------------------------------------------------------------------
+ 
+--- UnitIsUnit returns secret values in instances in Midnight, so off-tank detection no longer works.
++-- Experimental Forever off-tank detection. Never infer safety from secret data.
++local IsSecretValue = _G.issecretvalue or function() return false end
++
++local function IsReadableTrue(value)
++  return not IsSecretValue(value) and value == true
++end
++
++local function IsForeverUnitOfftanked(unitid)
++  if not ShowOffTank or Addon.GetPlayerRole() ~= "tank" then return false end
++
++  local in_raid = _G.IsInRaid()
++  local count = in_raid and _G.GetNumGroupMembers() or _G.GetNumSubgroupMembers()
++  local prefix = in_raid and "raid" or "party"
++  for i = 1, count do
++    local tank_unit = prefix .. i
++    local is_player = UnitIsUnit("player", tank_unit)
++    if not IsSecretValue(is_player) and not is_player and IsReadableTrue(UnitExists(tank_unit)) then
++      local role = _G.UnitGroupRolesAssigned(tank_unit)
++      local assigned = GetPartyAssignment and GetPartyAssignment("MAINTANK", tank_unit)
++      local is_tank = (not IsSecretValue(role) and role == "TANK") or IsReadableTrue(assigned)
++      if is_tank then
++        local status = UnitThreatSituation(tank_unit, unitid)
++        if not IsSecretValue(status) and type(status) == "number" and status >= 2 then
++          return true
++        end
++      end
++    end
++  end
++  return false
++end
++
+ local function CheckIfUnitIsOfftanked(unit, threat_level, other_player_has_aggro)
++  if Addon.IS_FOREVER then
++    -- Clear on every evaluation: unknown threat must never leave a stale safe color.
++    unit.IsOfftanked = other_player_has_aggro and IsForeverUnitOfftanked(unit.unitid) or false
++    return unit.IsOfftanked and "OFFTANK" or threat_level
++  end
+   -- Reset IsOfftanked if the player is tanking
+   -- Off-tank detection does not work in Midnight because of secret values
+   if other_player_has_aggro then
+@@ -170,6 +205,14 @@
+ 
+   -- ? Does it make sense to also check for this here: UnitThreatSituation("pet", unit.unitid)?
+   local threat_status = UnitThreatSituation("player", unit.unitid)
++  if Addon.IS_FOREVER then
++    unit.IsOfftanked = false
++    if IsSecretValue(threat_status) then return nil end
++    if threat_status == nil then
++      -- Also identify an off-tanked mob before the player joins its threat table.
++      return CheckIfUnitIsOfftanked(unit, nil, true)
++    end
++  end
+   if threat_status then
+     unit.HasThreatTable = true
+     return CheckIfUnitIsOfftanked(unit, THREAT_REFERENCE[threat_status], threat_status < 2)
+@@ -246,6 +289,7 @@
+ 
+ function ThreatModule.LeavingCombat()
+   for unitid, tp_frame in Addon:GetActiveThreatPlates() do
++    tp_frame.unit.IsOfftanked = false
+     tp_frame.unit.InCombat = _G.UnitAffectingCombat(unitid)
+     -- No need to query threat, just set it to nil (as no longer in combat)
+     UpdateThreatLevel(tp_frame, tp_frame.unit, nil)
+@@ -296,11 +340,11 @@
+ function ThreatModule.UpdateSettings()
+   Settings = Addon.db.profile.threat
+ 
+-  -- Off-tank detection and the threat heuristic are disabled on every client with Midnight's API surface
+-  -- (Addon.HAS_MIDNIGHT_API, not just Midnight itself): UnitThreatSituation/UnitIsUnit return secret values there.
++  -- Keep the legacy heuristic disabled on modern clients. Forever uses the guarded
++  -- group-tank scan above; Midnight retains its existing off-tank disable.
+   UseThreatTable = Settings.UseThreatTable or Addon.HAS_MIDNIGHT_API
+   UseHeuristicInInstances = Settings.UseHeuristicInInstances and not Addon.HAS_MIDNIGHT_API
+-  ShowOffTank = Settings.toggle.OffTank and not Addon.HAS_MIDNIGHT_API
++  ShowOffTank = Settings.toggle.OffTank and (Addon.IS_FOREVER or not Addon.HAS_MIDNIGHT_API)
+   ShowInstancesOnly = Settings.toggle.InstancesOnly
+ 
+   -- "OFFTANK" is only valid while the player is in tank role; recalculate when the role changes.
+--- a/Options.lua
++++ b/Options.lua
+@@ -11118,7 +11118,7 @@
+                   type = "group",
+                   order = 10,
+                   inline = true,
+-                  hidden = Addon.HAS_MIDNIGHT_API,
++                  hidden = Addon.HAS_MIDNIGHT_API and not Addon.IS_FOREVER,
+                   args = {
+                     OffTank = {
+                       type = "toggle",

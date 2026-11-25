@@ -135,9 +135,11 @@ local function IsReadableTrue(value)
   return not IsSecretValue(value) and value == true
 end
 
-local function IsForeverUnitOfftanked(unitid)
-  if not ShowOffTank or Addon.GetPlayerRole() ~= "tank" then return false end
+local ForeverTanks = {}
+local ForeverTankEvents
 
+local function RebuildForeverTankCache()
+  wipe(ForeverTanks)
   local in_raid = _G.IsInRaid()
   local count = in_raid and _G.GetNumGroupMembers() or _G.GetNumSubgroupMembers()
   local prefix = in_raid and "raid" or "party"
@@ -149,10 +151,51 @@ local function IsForeverUnitOfftanked(unitid)
       local assigned = GetPartyAssignment and GetPartyAssignment("MAINTANK", tank_unit)
       local is_tank = (not IsSecretValue(role) and role == "TANK") or IsReadableTrue(assigned)
       if is_tank then
-        local status = UnitThreatSituation(tank_unit, unitid)
-        if not IsSecretValue(status) and type(status) == "number" and status >= 2 then
-          return true
-        end
+        ForeverTanks[#ForeverTanks + 1] = tank_unit
+      end
+    end
+  end
+end
+
+local function RefreshForeverTankCache()
+  RebuildForeverTankCache()
+  -- Role changes and roster-token reuse must also clear existing off-tank colors.
+  for _, tp_frame in Addon:GetActiveThreatPlates() do
+    ThreatModule.Update(tp_frame)
+  end
+end
+
+local function ConfigureForeverTankCache()
+  wipe(ForeverTanks)
+  if not Addon.IS_FOREVER or not ShowOffTank then
+    if ForeverTankEvents then ForeverTankEvents:UnregisterAllEvents() end
+    return
+  end
+
+  if not ForeverTankEvents then
+    -- A dedicated frame keeps these subscriptions independent of the legacy
+    -- heuristic's PLAYER_ENTERING_WORLD handler and its event whitelist.
+    ForeverTankEvents = _G.CreateFrame("Frame")
+    ForeverTankEvents:SetScript("OnEvent", RefreshForeverTankCache)
+  end
+  ForeverTankEvents:RegisterEvent("GROUP_ROSTER_UPDATE")
+  ForeverTankEvents:RegisterEvent("PLAYER_ROLES_ASSIGNED")
+  ForeverTankEvents:RegisterEvent("ROLE_CHANGED_INFORM")
+  ForeverTankEvents:RegisterEvent("PLAYER_ENTERING_WORLD")
+  -- Refresh once at combat entry as well, never for individual threat updates.
+  ForeverTankEvents:RegisterEvent("PLAYER_REGEN_DISABLED")
+  RebuildForeverTankCache()
+end
+
+local function IsForeverUnitOfftanked(unitid)
+  if not ShowOffTank or Addon.GetPlayerRole() ~= "tank" then return false end
+
+  for i = 1, #ForeverTanks do
+    local tank_unit = ForeverTanks[i]
+    if IsReadableTrue(UnitExists(tank_unit)) then
+      local status = UnitThreatSituation(tank_unit, unitid)
+      if not IsSecretValue(status) and type(status) == "number" and status >= 2 then
+        return true
       end
     end
   end
@@ -346,6 +389,7 @@ function ThreatModule.UpdateSettings()
   UseHeuristicInInstances = Settings.UseHeuristicInInstances and not Addon.HAS_MIDNIGHT_API
   ShowOffTank = Settings.toggle.OffTank and (Addon.IS_FOREVER or not Addon.HAS_MIDNIGHT_API)
   ShowInstancesOnly = Settings.toggle.InstancesOnly
+  ConfigureForeverTankCache()
 
   -- "OFFTANK" is only valid while the player is in tank role; recalculate when the role changes.
   -- Only relevant before Mists: GetPlayerRole() reads live stance data there. From Mists onwards the
